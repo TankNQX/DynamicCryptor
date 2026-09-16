@@ -26,5 +26,13 @@ int main() {
         std::cout << " -> " << str << std::endl;
     }
 
+    // 1. Standard Narrow String (char)
+    const char* narrow_str = CRYPT_STR("Standard Hello");
+    std::cout << narrow_str << std::endl;
+
+    // 2. Wide String (wchar_t) - Works seamlessly via Windows API patterns
+    const wchar_t* wide_str = CRYPT_STR(L"Wide-String Hello Protection");
+    std::wcout << wide_str << std::endl;
+
     return 0;
 }
