@@ -42,7 +42,7 @@ For maximum stealth, ensure Release optimizations are active (`/O2`, `/Ob2`, and
 This project is licensed under the **MIT License**—see the [LICENSE](LICENSE) file for details.
 
 ### Acknowledgements & Development
-* **Architectural Concept:** Inspired by the pioneering compile-time string encryption layout of [skCrypter](https://github.com) (MIT License).
+* **Architectural Concept:** Inspired by the pioneering compile-time string encryption layout of [skCrypter]([https://github.com](https://github.com/skadro-official/skCrypter)) (MIT License).
 * **Implementation:** The multi-flavour polymorphic expansion, MSVC macro bug mitigation, and architecture for this header-only library were collaboratively co-developed with **Google's Gemini LLM** (September 2026).
 
 ## Disclaimer
