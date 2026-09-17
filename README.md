@@ -264,6 +264,7 @@ Build options:
 | `DYNAMICCRYPTER_BUILD_SALT` | `OFF` | Generate a random per-build salt and define `CRYPTER_BUILD_SALT`. |
 | `DYNAMICCRYPTER_SALT_VALUE` | empty | Use a specific hex salt (without the `0x` prefix) instead of generating one; stored in the cache so incremental builds stay stable. |
 | `DYNAMICCRYPTER_CXX_STANDARD` | `17` | Language standard used for the tests and the example. The library itself needs at least 17; the CI matrix uses this to check that newer standards keep working. |
+| `DYNAMICCRYPTER_WERROR` | `OFF` | Add `/WX` (MSVC) or `-Werror` (GCC/Clang) to the test and example targets. CI turns it on for two jobs. |
 
 The test target contains compile-time proofs plus run-time checks:
 

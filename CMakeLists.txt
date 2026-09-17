@@ -38,6 +38,16 @@ set(_salt_help
 
 option(DYNAMICCRYPTER_BUILD_SALT "Mix a random per-build salt into every key and flavour" OFF)
 
+# Treat compiler warnings as errors. Off by default, so a stricter compiler
+# cannot break a consumer's release build; CI turns it on for the warnings jobs.
+#
+# The flag is added per target rather than by replacing CMAKE_CXX_FLAGS. On MSVC
+# the toolchain defaults (/DWIN32 /D_WINDOWS /W3 /GR /EHsc) live *in*
+# CMAKE_CXX_FLAGS, so replacing it silently drops /EHsc - <iostream> then warns
+# C4530 ("exception handler used, but unwind semantics are not enabled") and,
+# with warnings as errors, fails the build.
+option(DYNAMICCRYPTER_WERROR "Treat compiler warnings as errors" OFF)
+
 if(DYNAMICCRYPTER_BUILD_SALT)
     set(DYNAMICCRYPTER_SALT_VALUE "" CACHE STRING "${_salt_help}")
     if(NOT DYNAMICCRYPTER_SALT_VALUE)
@@ -77,6 +87,9 @@ foreach(_dc_target DynamicCrypterTest DynamicCrypterExample)
             $<$<CONFIG:Release>:/GF>     # String pooling
             $<$<CONFIG:Release>:/MT>     # Statically link C runtime (no dependency on external MSVC DLLs)
         )
+        if(DYNAMICCRYPTER_WERROR)
+            target_compile_options(${_dc_target} PRIVATE /WX)
+        endif()
         # Remove runtime checks in release to prevent signature artifacts
         target_compile_definitions(${_dc_target} PRIVATE $<$<CONFIG:Release>:NDEBUG>)
     else()
@@ -89,5 +102,8 @@ foreach(_dc_target DynamicCrypterTest DynamicCrypterExample)
             $<$<CONFIG:Release>:-O3>
             $<$<CONFIG:Release>:-fomit-frame-pointer>
         )
+        if(DYNAMICCRYPTER_WERROR)
+            target_compile_options(${_dc_target} PRIVATE -Werror)
+        endif()
     endif()
 endforeach()

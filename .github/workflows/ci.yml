@@ -20,6 +20,13 @@
 #  Toolchain versions follow what the runner images happen to ship. If one
 #  disappears from an image the affected leg fails with an obvious
 #  "Unable to locate package" and only the matrix list needs adjusting.
+#
+#  One caution for future edits: never pass -DCMAKE_CXX_FLAGS to cmake. On MSVC
+#  the toolchain defaults (/DWIN32 /D_WINDOWS /W3 /GR /EHsc) live *in* that
+#  variable, so overriding it replaces them - which silently drops /EHsc and
+#  makes <iostream> emit C4530, a build failure under /WX. Use the CXXFLAGS
+#  environment variable for extra build flags (it initialises the variable and
+#  keeps the defaults) and the DYNAMICCRYPTER_WERROR option for warnings.
 # ============================================================================
 
 name: CI
@@ -162,12 +169,13 @@ jobs:
           sudo apt-get install -y -qq g++-multilib libc6-dev-i386
 
       - name: Configure (-m32)
+        env:
+          CXXFLAGS: -m32
+          LDFLAGS: -m32
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
-          -DCMAKE_CXX_FLAGS=-m32
-          -DCMAKE_EXE_LINKER_FLAGS=-m32
 
       - name: Build
         run: cmake --build build --parallel
@@ -218,11 +226,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
+        env:
+          # Extra build flags belong in CXXFLAGS: it *initialises*
+          # CMAKE_CXX_FLAGS, while -DCMAKE_CXX_FLAGS would replace the
+          # toolchain defaults (on MSVC that means losing /EHsc and /GR).
+          CXXFLAGS: "-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
-          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
 
       - name: Build
         run: cmake --build build --parallel
@@ -251,7 +263,7 @@ jobs:
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
-          -DCMAKE_CXX_FLAGS=-Werror
+          -DDYNAMICCRYPTER_WERROR=ON
 
       - name: Build
         run: cmake --build build --parallel
@@ -266,7 +278,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_CXX_FLAGS=/WX
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DDYNAMICCRYPTER_WERROR=ON
 
       - name: Build
         run: cmake --build build --config Release --parallel
