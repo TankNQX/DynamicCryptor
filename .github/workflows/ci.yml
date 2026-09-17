@@ -1,0 +1,495 @@
+# ============================================================================
+#  DynamicCrypter CI
+# ----------------------------------------------------------------------------
+#  The library is header-only, so every leg is the same shape: checkout, get a
+#  compiler, configure, build, run the tests. Because the test driver proves the
+#  algorithms with static_assert, a broken flavour fails at BUILD time rather
+#  than at run time.
+#
+#  Covered here:
+#    * GCC, Clang, AppleClang, MSVC (x64 and Win32) and MinGW-w64
+#    * x86-64, i386 (-m32) and arm64
+#    * Debug and Release - the optimizer behaves very differently, and this
+#      library's correctness depends on the transforms inlining or not
+#    * C++17 (the floor), C++20 and C++23
+#    * AddressSanitizer + UndefinedBehaviorSanitizer
+#    * warnings as errors, on GCC, Clang and MSVC
+#    * the two things that are easy to break silently: the C++17 requirement
+#      and the per-build salt wiring
+#
+#  Toolchain versions follow what the runner images happen to ship. If one
+#  disappears from an image the affected leg fails with an obvious
+#  "Unable to locate package" and only the matrix list needs adjusting.
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------------
+  #  GCC and Clang on x86-64 Linux, Debug and Release
+  # --------------------------------------------------------------------------
+  linux:
+    name: linux / ${{ matrix.cxx }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, g++-12, g++-13, g++-14, clang++, clang++-16, clang++-17, clang++-18]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make sure ${{ matrix.cxx }} is installed
+        run: |
+          set -euo pipefail
+          cxx='${{ matrix.cxx }}'
+          pkg=''
+          case "$cxx" in
+            g++-*)     pkg="g++-${cxx#g++-}" ;;
+            clang++-*) pkg="clang-${cxx#clang++-}" ;;
+          esac
+          if [ -n "$pkg" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "$pkg"
+          fi
+          "$cxx" --version | head -n 1
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  The lower end of the supported range (older image, older compilers)
+  # --------------------------------------------------------------------------
+  linux-older:
+    name: linux older / ${{ matrix.cxx }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++-10, g++-11, clang++-12, clang++-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ${{ matrix.cxx }}
+        run: |
+          set -euo pipefail
+          cxx='${{ matrix.cxx }}'
+          case "$cxx" in
+            g++-*)     pkg="g++-${cxx#g++-}" ;;
+            clang++-*) pkg="clang-${cxx#clang++-}" ;;
+          esac
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "$pkg"
+          "$cxx" --version | head -n 1
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  arm64 Linux (adjust or drop the runner label if your plan lacks arm64)
+  # --------------------------------------------------------------------------
+  linux-arm64:
+    name: linux arm64 / ${{ matrix.cxx }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  32-bit x86: a different endianness-preserving but width-changing ABI, which
+  #  is exactly where the 1/2/4 byte character handling could go wrong
+  # --------------------------------------------------------------------------
+  linux-i386:
+    name: linux i386 / ${{ matrix.cxx }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the 32-bit toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-multilib libc6-dev-i386
+
+      - name: Configure (-m32)
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_CXX_FLAGS=-m32
+          -DCMAKE_EXE_LINKER_FLAGS=-m32
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  Newer language standards: C++17 is the floor, not the ceiling
+  # --------------------------------------------------------------------------
+  standards:
+    name: C++${{ matrix.standard }} / ${{ matrix.cxx }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+        standard: [17, 20, 23]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DDYNAMICCRYPTER_CXX_STANDARD=${{ matrix.standard }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  Sanitizers. The test driver walks every dimension and every character
+  #  width, so this is where a stray signed shift or out-of-range access in the
+  #  transforms would surface.
+  # --------------------------------------------------------------------------
+  sanitizers:
+    name: asan+ubsan / ${{ matrix.cxx }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  Warnings as errors
+  # --------------------------------------------------------------------------
+  warnings:
+    name: -Werror / ${{ matrix.cxx }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_CXX_FLAGS=-Werror
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  warnings-msvc:
+    name: /W4 /WX msvc
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_CXX_FLAGS=/WX
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  The C++17 requirement must fail loudly, with the intended message rather
+  #  than a wall of template errors
+  # --------------------------------------------------------------------------
+  rejects-cxx14:
+    name: rejects C++14
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C++14 must not compile
+        run: |
+          set -euo pipefail
+          for cxx in g++ clang++; do
+            echo "--- $cxx -std=c++14"
+            set +e
+            output=$("$cxx" -std=c++14 -fsyntax-only -I Include test/main.cpp 2>&1)
+            status=$?
+            set -e
+            echo "$output" | head -n 5
+            if [ "$status" -eq 0 ]; then
+              echo "::error::$cxx accepted C++14, the standard check did not fire"
+              exit 1
+            fi
+            if ! grep -q "requires C++17 or newer" <<< "$output"; then
+              echo "::error::$cxx failed for the wrong reason (no C++17 diagnostic)"
+              exit 1
+            fi
+          done
+
+  # --------------------------------------------------------------------------
+  #  Per-build salt wiring: off by default and reproducible, on request and
+  #  binary-unique
+  # --------------------------------------------------------------------------
+  salt:
+    name: per-build salt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Default build is deterministic
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-off -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-off --parallel
+          ./build-off/DynamicCrypterTest | tee "$RUNNER_TEMP/off.txt"
+          grep -q "(deterministic)" "$RUNNER_TEMP/off.txt"
+
+      - name: Salted build is not
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-on -DCMAKE_BUILD_TYPE=Release -DDYNAMICCRYPTER_BUILD_SALT=ON
+          cmake --build build-on --parallel
+          ./build-on/DynamicCrypterTest | tee "$RUNNER_TEMP/on.txt"
+          grep -qE "build salt: 0x[0-9A-F]{8}" "$RUNNER_TEMP/on.txt"
+          if grep -q "(deterministic)" "$RUNNER_TEMP/on.txt"; then
+            echo "::error::DYNAMICCRYPTER_BUILD_SALT=ON did not reach the header"
+            exit 1
+          fi
+
+      - name: Two different salts give two different builds
+        run: |
+          set -euo pipefail
+          build_with_salt() {
+            cmake -S . -B build-cmp -DCMAKE_BUILD_TYPE=Release \
+                  -DDYNAMICCRYPTER_BUILD_SALT=ON -DDYNAMICCRYPTER_SALT_VALUE="$1"
+            cmake --build build-cmp --parallel
+          }
+          build_with_salt 11111111
+          ./build-cmp/DynamicCrypterTest | grep "build salt" > "$RUNNER_TEMP/salt-a.txt"
+          cp build-cmp/DynamicCrypterTest "$RUNNER_TEMP/exe-a"
+          build_with_salt 22222222
+          ./build-cmp/DynamicCrypterTest | grep "build salt" > "$RUNNER_TEMP/salt-b.txt"
+          cp build-cmp/DynamicCrypterTest "$RUNNER_TEMP/exe-b"
+          cat "$RUNNER_TEMP/salt-a.txt" "$RUNNER_TEMP/salt-b.txt"
+          if cmp -s "$RUNNER_TEMP/salt-a.txt" "$RUNNER_TEMP/salt-b.txt"; then
+            echo "::error::both salts produced the same header hash"
+            exit 1
+          fi
+          if cmp -s "$RUNNER_TEMP/exe-a" "$RUNNER_TEMP/exe-b"; then
+            echo "::error::two different salts produced identical binaries"
+            exit 1
+          fi
+
+  # --------------------------------------------------------------------------
+  #  AppleClang on arm64 macOS
+  # --------------------------------------------------------------------------
+  macos:
+    name: macos / ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  MSVC, both architectures, Debug and Release, plus one newer standard
+  # --------------------------------------------------------------------------
+  msvc:
+    name: msvc / ${{ matrix.arch }} / ${{ matrix.build_type }} / C++${{ matrix.standard }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, Win32]
+        build_type: [Debug, Release]
+        standard: ["17"]
+        include:
+          - arch: x64
+            build_type: Release
+            standard: "20"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -G "Visual Studio 17 2022"
+          -A ${{ matrix.arch }}
+          -DDYNAMICCRYPTER_CXX_STANDARD=${{ matrix.standard }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  GCC on Windows: the case where the platform is Windows but _MSC_VER is not
+  #  defined, which is where a portability assumption tends to hide
+  # --------------------------------------------------------------------------
+  mingw:
+    name: mingw-w64 / ${{ matrix.build_type }}
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 and put it on PATH
+        run: |
+          set -euo pipefail
+          choco install mingw --no-progress -y
+          gxx="$(find /c/ProgramData /c/tools -maxdepth 5 -iname 'g++.exe' -print -quit 2>/dev/null || true)"
+          if [ -z "$gxx" ]; then
+            echo "::error::g++.exe not found after installing MinGW-w64"
+            exit 1
+          fi
+          bin="$(dirname "$gxx")"
+          echo "MinGW-w64 bin: $bin"
+          "$bin/g++" --version | head -n 1
+          # GITHUB_PATH must hold a native Windows path for the runner and for
+          # CMake (a native binary) to find the compiler.
+          echo "$(cygpath -w "$bin")" >> "$GITHUB_PATH"
+
+      - name: Configure (Ninja)
+        run: >-
+          cmake -S . -B build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=g++
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  #  One check to require in branch protection, so adding a leg later does not
+  #  mean editing the protection settings
+  # --------------------------------------------------------------------------
+  ci-status:
+    name: CI status
+    if: always()
+    needs:
+      - linux
+      - linux-older
+      - linux-arm64
+      - linux-i386
+      - standards
+      - sanitizers
+      - warnings
+      - warnings-msvc
+      - rejects-cxx14
+      - salt
+      - macos
+      - msvc
+      - mingw
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail if any required job did not succeed
+        run: |
+          results='${{ join(needs.*.result, ',') }}'
+          echo "job results: $results"
+          case "$results" in
+            *failure*|*cancelled*)
+              echo "::error::a required job did not succeed"
+              exit 1
+              ;;
+          esac
+          echo "all required jobs succeeded"

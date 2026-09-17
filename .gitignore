@@ -1,38 +1,89 @@
-# Prerequisites
+# ---------------------------------------------------------------------------
+#  Compiled artifacts
+# ---------------------------------------------------------------------------
+
+# Prerequisites / dependency files
 *.d
 
-# Compiled Object files
+# Object files
 *.slo
 *.lo
 *.o
 *.obj
 
-# Precompiled Headers
+# Precompiled headers
 *.gch
 *.pch
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
+# Static libraries
 *.lai
 *.la
 *.a
 *.lib
+
+# Dynamic libraries
+*.so
+*.dylib
+*.dll
 
 # Executables
 *.exe
 *.out
 *.app
 
-# IDE-specific directories and files
+# MSVC / MSBuild intermediates, symbols and logs
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.tlog
+*.lastbuildstate
+
+# macOS debug symbol bundles
+*.dSYM/
+
+# Fortran module files
+*.mod
+*.smod
+
+# ---------------------------------------------------------------------------
+#  CMake
+# ---------------------------------------------------------------------------
+
+# Build trees. /build/ is what the README uses; the CI matrix also configures
+# build-off, build-on and build-cmp, and IDEs commonly use cmake-build-*.
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+
+# Files CMake writes next to the project when somebody configures in-tree
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+DartConfiguration.tcl
+install_manifest.txt
+Testing/
+compile_commands.json
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Personal presets. CMakePresets.json itself is meant to be committed; only the
+# user-local variant is ignored, which is the convention CMake documents.
+/CMakeUserPresets.json
+
+# ---------------------------------------------------------------------------
+#  Editors and IDEs
+# ---------------------------------------------------------------------------
 .vs/
+.vscode/
+.idea/
+.clangd/
+.cache/
 Vanguard/
 Out/
 Generated_Files/
@@ -45,10 +96,26 @@ _ReSharper*/
 *.vcxproj.filters
 *.vcxproj.user
 
-# CMake build directories
-/build/
-/CMakeUserPresets.json
+# ---------------------------------------------------------------------------
+#  macOS and Linux
+# ---------------------------------------------------------------------------
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+*~
+/core
+/core.[0-9]*
 
-# Backup/crash files
+# ---------------------------------------------------------------------------
+#  Tooling scratch
+#  Reasonix keeps per-task runtime state under .reasonix/tasks/. Anything
+#  authored under .reasonix/ (for example .reasonix/skills/) stays tracked.
+# ---------------------------------------------------------------------------
+.reasonix/tasks/
+
+# ---------------------------------------------------------------------------
+#  Backup and log files
+# ---------------------------------------------------------------------------
 *.bak
 *.log
