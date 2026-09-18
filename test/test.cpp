@@ -9,9 +9,11 @@
 //      random dimension combinations and for every character type, so a broken
 //      dimension cannot even be built.
 //
-//   2. Run-time checks. The RAII and legacy macros are checked against their
-//      documented lifetimes, and every preset is exercised end to end through
-//      the core engine.
+//   2. Run-time checks. The object macro is checked against its documented
+//      lifetime and state machine - it decodes on read, encrypt() hides the
+//      text again, clear() ends it - decoding is shown to leave the site's own
+//      storage untouched, and every preset is exercised end to end through the
+//      core engine.
 //
 //  The compile-time proofs are deliberately split into many small evaluations
 //  (one static_assert per flavour) instead of a few recursive ones, because
@@ -26,7 +28,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
-#include <vector>
 
 #include "DynamicCrypter.hpp"
 
@@ -83,31 +84,42 @@ constexpr char32_t kU32[] = U"UTF-32 polymorphic round trip 0123456789";
 // ---------------------------------------------------------------------------
 
 // plain -> cipher -> plain must be the identity, and re-encrypting that plain
-// text must reproduce the original ciphertext byte for byte. That second part
-// is what CRYPT_STR() relies on when it restores the ciphertext at scope exit.
+// text must reproduce the original ciphertext byte for byte. On top of that the
+// ciphertext has to survive the decode: the inverse writes into a buffer of its
+// own, so a decode cannot overwrite the encrypted bytes it read.
 // The transform helpers take pointers, so CharType and Size are supplied
 // explicitly (they cannot be deduced from a plain pointer argument).
 template <typename FlavourT, uint32_t Seed, typename CharType, size_t Size>
 constexpr bool roundtrip_seed(const CharType (&plaintext)[Size]) noexcept {
     CharType cipher[Size] = {};
-    CharType buffer[Size] = {};
+    CharType cipher_copy[Size] = {};
+    CharType plain_out[Size] = {};
+    CharType reencrypted[Size] = {};
 
     DynamicCrypter::detail::transform_forward<FlavourT, Seed, CharType, Size>(cipher, plaintext);
 
     for (size_t i = 0; i < Size; ++i) {
-        buffer[i] = cipher[i];
+        cipher_copy[i] = cipher[i];
     }
 
-    DynamicCrypter::detail::transform_inverse<FlavourT, Seed, CharType, Size>(buffer);
+    DynamicCrypter::detail::transform_inverse<FlavourT, Seed, CharType, Size>(plain_out, cipher);
     for (size_t i = 0; i < Size; ++i) {
-        if (buffer[i] != plaintext[i]) {
+        if (plain_out[i] != plaintext[i]) {
             return false;
         }
     }
 
-    DynamicCrypter::detail::transform_forward<FlavourT, Seed, CharType, Size>(buffer, buffer);
+    // Nothing was decoded in place: the ciphertext reads back exactly as it was.
     for (size_t i = 0; i < Size; ++i) {
-        if (buffer[i] != cipher[i]) {
+        if (cipher[i] != cipher_copy[i]) {
+            return false;
+        }
+    }
+
+    DynamicCrypter::detail::transform_forward<FlavourT, Seed, CharType, Size>(reencrypted,
+                                                                             plain_out);
+    for (size_t i = 0; i < Size; ++i) {
+        if (reencrypted[i] != cipher_copy[i]) {
             return false;
         }
     }
@@ -301,38 +313,114 @@ static_assert(selection_covers_all_dimensions(),
 // ---------------------------------------------------------------------------
 //  Runtime helpers
 // ---------------------------------------------------------------------------
-// Re-enters one single CRYPT_STR() call site while the previous view of that
-// same site is still alive. Returns the number of failed checks.
+// Re-enters one single CRYPT_STR() call site while the previous object from
+// that same site is still alive. Every object owns its own buffer, so the
+// re-entrant ones cannot disturb the outer one. Returns the number of failed
+// checks.
 int nest_same_site(int depth) {
     auto view = CRYPT_STR("same site, overlapping lifetimes");
     int problems = same_text(view.get(), "same site, overlapping lifetimes") ? 0 : 1;
     if (depth > 0) {
         problems += nest_same_site(depth - 1);
     }
-    // The outer view must still read correctly once the recursion unwinds.
+    // The outer object must still read correctly once the recursion unwinds.
     if (!same_text(view.get(), "same site, overlapping lifetimes")) {
         ++problems;
     }
     return problems;
 }
 
-// One CRYPT_STR_RAW() call site, entered once per call. Repeating the call must
-// keep returning the same plaintext: the historical implementation decrypted
-// the buffer again on every call and therefore alternated between plaintext and
-// garbage.
-const char* raw_site() {
-    return CRYPT_STR_RAW("raw site, entered repeatedly");
+// The object model, checked end to end: decoding lands in the object's own
+// buffer and leaves the site's ciphertext byte for byte as it was, encrypt()
+// puts ciphertext back in that same buffer, any read decodes it again, and
+// clear() ends the string for good. Returns the number of failed checks.
+template <typename CharType, size_t Size, typename FlavourT, uint32_t Seed>
+int crypter_checks(const CharType (&plaintext)[Size]) {
+    using Cipher = DynamicCrypter::EncryptedString<CharType, Size, FlavourT, Seed>;
+    using Object = DynamicCrypter::Crypter<CharType, Size, FlavourT, Seed>;
+
+    int problems = 0;
+    const Cipher site(plaintext);
+
+    CharType cipher[Size] = {};
+    for (size_t i = 0; i < Size; ++i) {
+        cipher[i] = site.data()[i];
+    }
+
+    // A fresh object holds the plaintext, in storage of its own.
+    Object text(site);
+    if (!same_text(text.get(), plaintext) || text.isEncrypted()) {
+        ++problems;
+    }
+    if (text.get() == site.data()) {
+        ++problems;
+    }
+    for (size_t i = 0; i < Size; ++i) {
+        if (site.data()[i] != cipher[i]) {
+            ++problems;
+        }
+    }
+
+    // encrypt() hides it again - in the object's buffer, not the site's - and
+    // the next read decodes without any further call.
+    text.encrypt();
+    if (!text.isEncrypted() || !same_text(text.get(), plaintext) || text.isEncrypted()) {
+        ++problems;
+    }
+    for (size_t i = 0; i < Size; ++i) {
+        if (site.data()[i] != cipher[i]) {
+            ++problems;
+        }
+    }
+
+    // decrypt() is the explicit form of the same read, and clear() is final:
+    // a cleared object stays empty even if it is encrypted or decrypted again.
+    text.decrypt();
+    if (!same_text(text.get(), plaintext)) {
+        ++problems;
+    }
+    text.clear();
+    text.decrypt();
+    text.encrypt();
+    if (text.isEncrypted()) {
+        ++problems;
+    }
+    for (size_t i = 0; i < Size; ++i) {
+        if (text.get()[i] != static_cast<CharType>(0)) {
+            ++problems;
+        }
+    }
+
+    return problems;
 }
 
-// Full cycle through the core engine for one flavour, at run time.
+// Full cycle through the core engine for one flavour, at run time: decode into a
+// buffer of its own, check the ciphertext is still intact, then decode it again
+// and get the same plaintext back.
 template <typename FlavourT, typename CharType, size_t Size>
 bool runtime_roundtrip(const CharType (&plaintext)[Size]) {
     DynamicCrypter::EncryptedString<CharType, Size, FlavourT, 0x51ED270Bu> s(plaintext);
-    if (!same_text(s.decrypt(), plaintext)) {
+
+    CharType cipher[Size] = {};
+    for (size_t i = 0; i < Size; ++i) {
+        cipher[i] = s.data()[i];
+    }
+
+    CharType decoded[Size] = {};
+    s.decrypt(decoded);
+    if (!same_text(decoded, plaintext)) {
         return false;
     }
-    s.encrypt();
-    return same_text(s.decrypt(), plaintext);
+
+    for (size_t i = 0; i < Size; ++i) {
+        if (s.data()[i] != cipher[i]) {
+            return false;
+        }
+    }
+
+    CharType decoded_again[Size] = {};
+    s.decrypt(decoded_again);
+    return same_text(decoded_again, plaintext);
 }
 
 #define CHECK_RUNTIME(label, keygen_name, combiner_name, mode_name, order_name, literal)        \
@@ -398,11 +486,10 @@ int main() {
     }
 
     // -----------------------------------------------------------------------
-    //  3. CRYPT_STR() - the RAII form
+    //  3. CRYPT_STR() - one object, one string
     // -----------------------------------------------------------------------
-    std::printf("\n[:] CRYPT_STR() (RAII)\n");
+    std::printf("\n[:] CRYPT_STR()\n");
 
-    const char* leaked = nullptr;
     {
         auto message = CRYPT_STR("Hello World! This uses one polymorphic flavour.");
         report("decrypts", same_text(message.get(), "Hello World! This uses one polymorphic flavour."));
@@ -412,10 +499,7 @@ int main() {
         report("implicit conversion", same_text(as_pointer, "Hello World! This uses one polymorphic flavour."));
         report("exposes the full length",
                message.size() == sizeof("Hello World! This uses one polymorphic flavour."));
-        leaked = message.get();
     }
-    report("re-encrypts at scope exit",
-           !same_text(leaked, "Hello World! This uses one polymorphic flavour."));
 
     {
         auto hosted = CRYPT_STR("https://secure-endpoint.local");
@@ -431,34 +515,44 @@ int main() {
 
     std::cout << "    streamed: " << CRYPT_STR("straight into std::cout") << std::endl;
     // Variadic argument lists do not apply user defined conversions, so
-    // printf-style APIs need .get() - or CRYPT_STR_RAW, which already yields a
-    // raw pointer.
+    // printf-style APIs need .get().
     std::printf("    streamed: %s\n", CRYPT_STR("into printf via .get()").get());
-    std::printf("    streamed: %s\n", CRYPT_STR_RAW("into printf via CRYPT_STR_RAW"));
 
     // -----------------------------------------------------------------------
-    //  4. CRYPT_STR_RAW() - the legacy pointer form
+    //  4. The object owns the string: decode, hide, clear
     // -----------------------------------------------------------------------
-    std::printf("\n[:] CRYPT_STR_RAW() (legacy pointer form)\n");
+    std::printf("\n[:] one object, one string it owns\n");
 
-    const char* raw = CRYPT_STR_RAW("Array Element A");
-    report("outlives the statement", same_text(raw, "Array Element A"));
-    report("stable across repeated calls of one site",
-           same_text(raw_site(), "raw site, entered repeatedly") &&
-               same_text(raw_site(), "raw site, entered repeatedly") &&
-               same_text(raw_site(), "raw site, entered repeatedly"));
+    report("a site stays ciphertext, the object owns the text",
+           crypter_checks<char, sizeof("decoded into the object, not the blob"),
+                          DynamicCrypter::FlavourOf<0x5EED1234u>, 0x5EED1234u>(
+               "decoded into the object, not the blob") == 0);
+    report("the same holds for wide characters",
+           crypter_checks<wchar_t, sizeof(L"wide, and still the object's own") / sizeof(wchar_t),
+                          DynamicCrypter::Presets::classic_3, 0x00C0FFEEu>(
+               L"wide, and still the object's own") == 0);
 
-    const std::vector<const char*> protected_array = {
-        CRYPT_STR_RAW("Array Element A"),
-        CRYPT_STR_RAW("Array Element B"),
-        CRYPT_STR_RAW("Array Element C"),
-    };
-    const char* expected[] = {"Array Element A", "Array Element B", "Array Element C"};
-    bool array_ok = protected_array.size() == 3;
-    for (size_t i = 0; i < protected_array.size() && array_ok; ++i) {
-        array_ok = same_text(protected_array[i], expected[i]);
+    {
+        // The same state machine through the macro: encrypt() hides the text
+        // again inside the object's own buffer, a read decodes it back, and
+        // clear() is the end of the string.
+        auto message = CRYPT_STR("encrypt, read, clear");
+        report("reads decode", same_text(message.get(), "encrypt, read, clear"));
+
+        message.encrypt();
+        report("encrypt() reports ciphertext", message.isEncrypted());
+        report("a read decodes it again",
+               same_text(message.get(), "encrypt, read, clear") && !message.isEncrypted());
+
+        message.clear();
+        report("clear() ends the string",
+               !message.isEncrypted() && message.get()[0] == '\0');
     }
-    report("inside a container", array_ok);
+
+    // The destructor runs the same clear() that was just checked, so the wipe
+    // itself needs no separate test; reading the buffer after the object dies
+    // would be use-after-scope, which is exactly what the sanitizer job exists
+    // to catch, so the test suite deliberately does not do it.
 
     // -----------------------------------------------------------------------
     //  5. Repeated and overlapping use of one call site

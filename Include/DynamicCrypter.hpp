@@ -11,9 +11,15 @@
 //  site from a hash of the site, the source position and an optional per-build
 //  salt. See the README for the dimension tables and the classic presets.
 //
+//  CRYPT_STR() yields one small object that owns its string and can flip it
+//  between its plain and cipher forms on request - encrypt(), decrypt(),
+//  isEncrypted(), clear(), in the spirit of skCrypter - with C++ looking after
+//  the lifetime: the buffer is the object's own, and its destructor clears it.
+//  The blob the object seeds from is a read-only compile-time constant that
+//  nothing ever writes to.
+//
 //  Quick start:
-//      std::cout << CRYPT_STR("Hello World!") << std::endl;   // RAII variant
-//      const char* p = CRYPT_STR_RAW("kept alive");           // legacy variant
+//      std::cout << CRYPT_STR("Hello World!") << std::endl;
 // ============================================================================
 #ifndef DYNAMICCRYPTER_HPP
 #define DYNAMICCRYPTER_HPP
@@ -584,8 +590,16 @@ namespace DynamicCrypter {
             }
         }
 
+        // The inverse reads `in` and writes `out`. Passing the same buffer for
+        // both is supported, and is what the Crypter object does when it turns
+        // its own ciphertext back into text; walking the processing order
+        // backwards is what makes that safe. The chaining modes need the
+        // ciphertext of the *preceding* step, and in a descending walk that
+        // slot has not been overwritten yet, so an in-place decode reads the
+        // bytes it still needs. Out of place it is just a read of an untouched
+        // input buffer, which is how a Crypter seeds itself from its site.
         template <typename FlavourT, uint32_t Seed, typename CharType, size_t Size>
-        constexpr void transform_inverse(CharType* buf) noexcept {
+        constexpr void transform_inverse(CharType* out, const CharType* in) noexcept {
             using U = uint_type<CharType>;
             constexpr Combiner CB = FlavourT::combiner;
             constexpr Mode MD = FlavourT::mode;
@@ -594,21 +608,17 @@ namespace DynamicCrypter {
             U keys[Size] = {};
             make_keystream<FlavourT::keygen, Seed>(keys);
 
-            // Walking the processing order backwards is what makes in-place
-            // decryption possible: the ciphertext of the preceding step - the
-            // value the chain needs - has not been overwritten yet, because only
-            // later steps have been processed at this point.
             [[maybe_unused]] const U iv = chaining_iv<U, Seed>();
 
             for (size_t step = Size; step-- > 0;) {
                 const size_t i = step_index<OD, Seed, Size>(step);
-                const U cipher = static_cast<U>(buf[i]);
+                const U cipher = static_cast<U>(in[i]);
 
                 [[maybe_unused]] U previous = 0;
                 if constexpr (MD != Mode::stream) {
                     previous = (step == 0)
                                    ? iv
-                                   : static_cast<U>(buf[step_index<OD, Seed, Size>(step - 1)]);
+                                   : static_cast<U>(in[step_index<OD, Seed, Size>(step - 1)]);
                 }
 
                 U plain = cipher;
@@ -620,7 +630,7 @@ namespace DynamicCrypter {
                     plain = uncombine<CB>(cipher, keys[i]);
                 }
 
-                buf[i] = static_cast<CharType>(plain);
+                out[i] = static_cast<CharType>(plain);
             }
         }
 
@@ -651,8 +661,8 @@ namespace DynamicCrypter {
     } // namespace Presets
 
     // -----------------------------------------------------------------------
-    //  Core engine: holds the encrypted characters and can convert the buffer
-    //  between its cipher and plain forms in place.
+    //  Core engine: holds the encrypted characters. Decryption is out of place
+    //  - the stored ciphertext is read-only in every way that matters.
     // -----------------------------------------------------------------------
     template <typename CharType, size_t Size, typename FlavourT, uint32_t Seed>
     class EncryptedString {
@@ -672,17 +682,14 @@ namespace DynamicCrypter {
         EncryptedString(const EncryptedString&) = delete;
         EncryptedString& operator=(const EncryptedString&) = delete;
 
-        // In place decryption; returns the decrypted buffer.
-        CRYPTER_FORCEINLINE constexpr const CharType* decrypt() noexcept {
-            detail::transform_inverse<FlavourT, Seed, CharType, Size>(_storage);
-            return _storage;
-        }
-
-        // Re-applies the forward transform, restoring the ciphertext. This is
-        // what makes it possible to take the plaintext back out of memory.
-        CRYPTER_FORCEINLINE constexpr const CharType* encrypt() noexcept {
-            detail::transform_forward<FlavourT, Seed, CharType, Size>(_storage, _storage);
-            return _storage;
+        // Out of place decryption: writes size() characters of plaintext into
+        // `out` and leaves the stored ciphertext untouched. There is therefore
+        // no moment at which the encrypted bytes *are* the plaintext, and
+        // nothing to restore afterwards - the cipher is still the cipher when
+        // this returns. `out` is not bounds checked: it has to hold at least
+        // size() characters.
+        CRYPTER_FORCEINLINE constexpr void decrypt(CharType* out) const noexcept {
+            detail::transform_inverse<FlavourT, Seed, CharType, Size>(out, _storage);
         }
 
         CRYPTER_FORCEINLINE constexpr const CharType* data() const noexcept { return _storage; }
@@ -692,60 +699,112 @@ namespace DynamicCrypter {
         CharType _storage[Size];
     };
 
-    namespace detail {
-
-        // One of these exists per CRYPT_STR() call site and owns the encrypted
-        // buffer plus the bookkeeping needed to know whether that buffer
-        // currently holds plaintext.
-        template <typename CharType, size_t Size, typename FlavourT, uint32_t Seed>
-        struct StringSite {
-            EncryptedString<CharType, Size, FlavourT, Seed> cipher;
-            unsigned depth;
-
-            constexpr StringSite(const CharType* plaintext) noexcept
-                : cipher(plaintext), depth(0u) {}
-        };
-
-    } // namespace detail
-
     // -----------------------------------------------------------------------
-    //  RAII view on a decrypted string.
-    //  The buffer is decrypted when the first view is created and re-encrypted
-    //  once the last view goes out of scope, so no plaintext is left behind.
+    //  The object CRYPT_STR() yields: one string, owned by that object, which
+    //  flips between its cipher and plain forms on request.
+    // -----------------------------------------------------------------------
+    //  This is the skCrypter model with the lifetime left entirely to C++: the
+    //  object owns its buffer, so there is no shared per-site state, no writable
+    //  static copy of the ciphertext, and no bookkeeping to keep in step when
+    //  two objects happen to come from the same call site.
+    //
+    //      plain    - what a freshly built object holds; reads return the text
+    //      cipher   - encrypt() has put ciphertext back in the buffer; the next
+    //                 read decodes it again ("auto decrypt on use")
+    //      cleared  - clear() has run; the string is gone for good
+    //
+    //  The site's blob in EncryptedString is never written to. The object seeds
+    //  itself from it once, and encrypt() recomputes ciphertext from what the
+    //  object's own buffer holds - same flavour, same seed, so the same bytes.
+    //
+    //  Reads and state changes are const-callable, which is why the buffer and
+    //  the state flag are `mutable`: an object passed on as `const&` can still
+    //  be read. The consequence is that one object is not thread safe - two
+    //  threads reading it race on the decode.
+    //
     //  The pointer handed out is only valid while this object lives.
     // -----------------------------------------------------------------------
     template <typename CharType, size_t Size, typename FlavourT, uint32_t Seed>
-    class DecryptedString {
+    class Crypter {
+        // Explicit, rather than inferred from the data the way skCrypter's
+        // isEncrypted() infers it from a NUL terminator: the transforms here do
+        // not leave a recognisable sentinel in the buffer to test, and a flag
+        // cannot be wrong.
+        enum class State : unsigned char { plain, cipher, cleared };
+
     public:
-        CRYPTER_FORCEINLINE explicit DecryptedString(
-            detail::StringSite<CharType, Size, FlavourT, Seed>& site) noexcept
-            : _site(&site), _ptr(site.cipher.data()) {
-            if (_site->depth++ == 0u) {
-                _ptr = _site->cipher.decrypt();
-            }
+        // Decodes the site's compile-time blob into this object's own buffer.
+        CRYPTER_FORCEINLINE explicit Crypter(
+            const EncryptedString<CharType, Size, FlavourT, Seed>& site) noexcept
+            : _storage{}, _state(State::plain) {
+            site.decrypt(_storage);
         }
 
-        CRYPTER_FORCEINLINE ~DecryptedString() noexcept {
-            if (--_site->depth == 0u) {
-                _site->cipher.encrypt();
-            }
-        }
+        // The object owns the plaintext, so its death is the plaintext's death.
+        // That is what leaving the lifetime to C++ means here: no plaintext
+        // outlives the object that holds it.
+        CRYPTER_FORCEINLINE ~Crypter() noexcept { clear(); }
 
-        CRYPTER_FORCEINLINE const CharType* get() const noexcept { return _ptr; }
-        CRYPTER_FORCEINLINE const CharType* c_str() const noexcept { return _ptr; }
-        CRYPTER_FORCEINLINE const CharType* data() const noexcept { return _ptr; }
+        CRYPTER_FORCEINLINE const CharType* get() const noexcept { return decrypt(); }
+        CRYPTER_FORCEINLINE const CharType* c_str() const noexcept { return decrypt(); }
+        CRYPTER_FORCEINLINE const CharType* data() const noexcept { return decrypt(); }
         static constexpr size_t size() noexcept { return Size; }
 
         // Implicit so that the object can be streamed and compared exactly like
-        // the underlying raw pointer.
-        CRYPTER_FORCEINLINE operator const CharType*() const noexcept { return _ptr; }
+        // the underlying raw pointer. Reading decodes first, which is what makes
+        // `use(CRYPT_STR("..."))` work with no call of its own.
+        CRYPTER_FORCEINLINE operator const CharType*() const noexcept { return decrypt(); }
 
-        DecryptedString(const DecryptedString&) = delete;
-        DecryptedString& operator=(const DecryptedString&) = delete;
+        // Decodes in place if the buffer holds ciphertext, and does nothing
+        // otherwise, so a cleared object stays empty instead of being
+        // resurrected. Returns the buffer either way.
+        CRYPTER_FORCEINLINE const CharType* decrypt() const noexcept {
+            if (_state == State::cipher) {
+                detail::transform_inverse<FlavourT, Seed, CharType, Size>(_storage, _storage);
+                _state = State::plain;
+            }
+            return _storage;
+        }
+
+        // Puts the ciphertext back, in place, so the plaintext is not sitting in
+        // the buffer while the object waits to be used again. Encryption and
+        // decryption are not the same operation here (unlike skCrypter's XOR),
+        // so each one is its own call.
+        CRYPTER_FORCEINLINE const CharType* encrypt() const noexcept {
+            if (_state == State::plain) {
+                detail::transform_forward<FlavourT, Seed, CharType, Size>(_storage, _storage);
+                _state = State::cipher;
+            }
+            return _storage;
+        }
+
+        CRYPTER_FORCEINLINE bool isEncrypted() const noexcept { return _state == State::cipher; }
+
+        // Zeroes the buffer and ends this object's string for good: there is no
+        // way back from here, and a cleared object reads as the empty string.
+        // The destructor does the same, so the plaintext can also be dropped
+        // early instead of waiting for the scope to end.
+        //
+        // The stores go through a volatile lvalue deliberately: a plain store
+        // into memory whose owner is going away is exactly the kind of write an
+        // optimizer may delete, and then the wipe would be a comment rather than
+        // code. It stays best effort either way - the characters may also sit in
+        // a register or in a copy the C library made - so read this as narrowing
+        // the window, not as a guarantee.
+        CRYPTER_FORCEINLINE void clear() const noexcept {
+            volatile CharType* plain = _storage;
+            for (size_t i = 0; i < Size; ++i) {
+                plain[i] = static_cast<CharType>(0);
+            }
+            _state = State::cleared;
+        }
+
+        Crypter(const Crypter&) = delete;
+        Crypter& operator=(const Crypter&) = delete;
 
     private:
-        detail::StringSite<CharType, Size, FlavourT, Seed>* _site;
-        const CharType* _ptr;
+        mutable CharType _storage[Size];
+        mutable State _state;
     };
 
 } // namespace DynamicCrypter
@@ -773,13 +832,25 @@ namespace DynamicCrypter {
 #define CRYPTER_SEED CRYPTER_SITE_HASH(__LINE__, CRYPTER_COUNTER)
 
 // ---------------------------------------------------------------------------
-//  CRYPT_STR - preferred form.
-//  Yields a small RAII object that converts to const CharType* and restores the
-//  ciphertext at the end of the enclosing scope.
+//  CRYPT_STR - the only form.
+//  Yields a small object that owns the string and can flip it between plain and
+//  cipher: reads decode on demand, encrypt() puts the ciphertext back,
+//  isEncrypted() reports which state the buffer is in, and clear() - or the
+//  destructor, at the end of the scope - zeroes it. It converts to
+//  const CharType*, so it streams, prints and compares like the pointer it wraps.
 //
 //      std::cout << CRYPT_STR("streamed, dies with the statement") << '\n';
 //      auto message = CRYPT_STR("alive as long as `message` is");
-//      use(message);        // implicit conversion, .get(), .c_str(), .data()
+//      use(message);          // implicit conversion, .get(), .c_str(), .data()
+//      message.encrypt();     // hide it again for the rest of the scope
+//
+//  The site is declared `static const`: nothing in the library writes to it, so
+//  the ciphertext stays a read-only compile-time constant and the buffer being
+//  flipped is always the object's own.
+//
+//  The pointer stays valid only while the object lives, so a const char* that
+//  has to outlive the statement cannot come from here: copy the characters into
+//  storage the caller owns.
 // ---------------------------------------------------------------------------
 #define CRYPT_STR(str)                                                                         \
     ([]() {                                                                                    \
@@ -791,45 +862,17 @@ namespace DynamicCrypter {
         constexpr size_t CRYPTER_SIZE_T = sizeof(str) / sizeof(CRYPTER_CHAR_T);                \
         constexpr uint32_t CRYPTER_HASH_T = CRYPTER_SITE_HASH(__LINE__, CRYPTER_COUNTER);      \
         using CRYPTER_FLAVOUR_T = DynamicCrypter::FlavourOf<CRYPTER_HASH_T>;                    \
-        using CRYPTER_SITE_T =                                                                 \
-            DynamicCrypter::detail::StringSite<CRYPTER_CHAR_T, CRYPTER_SIZE_T,                 \
-                                               CRYPTER_FLAVOUR_T, CRYPTER_HASH_T>;             \
-        static CRYPTER_SITE_T CRYPTER_SITE_VAR((str));                                         \
-        return DynamicCrypter::DecryptedString<CRYPTER_CHAR_T, CRYPTER_SIZE_T,                 \
-                                               CRYPTER_FLAVOUR_T, CRYPTER_HASH_T>(             \
-            CRYPTER_SITE_VAR);                                                                 \
-    }())
-
-// ---------------------------------------------------------------------------
-//  CRYPT_STR_RAW - legacy pointer form.
-//  Decrypts once on first use and leaves the plaintext in place. Use it when
-//  the const char* has to outlive the statement; prefer CRYPT_STR() otherwise,
-//  since this variant never re-encrypts.
-// ---------------------------------------------------------------------------
-#define CRYPT_STR_RAW(str)                                                                     \
-    ([]() {                                                                                    \
-        using CRYPTER_CHAR_T =                                                                 \
-            std::remove_cv_t<std::remove_pointer_t<std::decay_t<decltype(str)>>>;              \
-        static_assert(std::is_array<std::remove_reference_t<decltype(str)>>::value,            \
-                      "CRYPT_STR_RAW() needs a string literal or a character array, "          \
-                      "not a pointer: sizeof() would not know the length");                    \
-        constexpr size_t CRYPTER_SIZE_T = sizeof(str) / sizeof(CRYPTER_CHAR_T);                \
-        constexpr uint32_t CRYPTER_HASH_T = CRYPTER_SITE_HASH(__LINE__, CRYPTER_COUNTER);      \
-        using CRYPTER_FLAVOUR_T = DynamicCrypter::FlavourOf<CRYPTER_HASH_T>;                    \
-        using CRYPTER_SITE_T =                                                                 \
-            DynamicCrypter::detail::StringSite<CRYPTER_CHAR_T, CRYPTER_SIZE_T,                 \
-                                               CRYPTER_FLAVOUR_T, CRYPTER_HASH_T>;             \
-        static CRYPTER_SITE_T CRYPTER_SITE_VAR((str));                                         \
-        if (CRYPTER_SITE_VAR.depth == 0u) {                                                    \
-            CRYPTER_SITE_VAR.depth = 1u;                                                       \
-            CRYPTER_SITE_VAR.cipher.decrypt();                                                 \
-        }                                                                                      \
-        return CRYPTER_SITE_VAR.cipher.data();                                                 \
+        using CRYPTER_CIPHER_T =                                                               \
+            DynamicCrypter::EncryptedString<CRYPTER_CHAR_T, CRYPTER_SIZE_T,                    \
+                                            CRYPTER_FLAVOUR_T, CRYPTER_HASH_T>;                \
+        static const CRYPTER_CIPHER_T CRYPTER_CIPHER_VAR((str));                               \
+        return DynamicCrypter::Crypter<CRYPTER_CHAR_T, CRYPTER_SIZE_T, CRYPTER_FLAVOUR_T,       \
+                                       CRYPTER_HASH_T>(CRYPTER_CIPHER_VAR);                    \
     }())
 
 // Only resolved while this header is being parsed, so it can be cleaned up.
-// CRYPTER_COUNTER and CRYPTER_SITE_HASH must stay defined: CRYPT_STR() and
-// CRYPT_STR_RAW() expand in the caller's translation unit and use them.
+// CRYPTER_COUNTER and CRYPTER_SITE_HASH must stay defined: CRYPT_STR() expands
+// in the caller's translation unit and uses them.
 #undef CRYPTER_CPLUSPLUS
 
 #endif // DYNAMICCRYPTER_HPP
