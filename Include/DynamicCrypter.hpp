@@ -18,6 +18,13 @@
 //  The blob the object seeds from is a read-only compile-time constant that
 //  nothing ever writes to.
 //
+//  One consequence of being a constant expression is worth knowing about: the
+//  ciphertext is a constant too, so an optimizer could in principle evaluate a
+//  whole decode at compile time and emit the plaintext as data. Every runtime
+//  decode therefore reads the ciphertext through a volatile view first
+//  (detail::copy_opaque), which is the one kind of load a compiler may not
+//  fold. See the README for what that does and does not buy.
+//
 //  Quick start:
 //      std::cout << CRYPT_STR("Hello World!") << std::endl;
 // ============================================================================
@@ -66,6 +73,22 @@
 #    define CRYPTER_FORCEINLINE inline __attribute__((always_inline))
 #  else
 #    define CRYPTER_FORCEINLINE inline
+#  endif
+#endif
+
+// Never-inline hint, used for the one copy that has to stay opaque to the
+// optimizer (see detail::copy_opaque). Override by defining CRYPTER_NOINLINE
+// before including this header - defining it to nothing lets that copy inline,
+// which is a little faster and a little less resistant to whole-program
+// constant propagation.
+#ifndef CRYPTER_NOINLINE
+#  if defined(_MSC_VER)
+#    define CRYPTER_NOINLINE __declspec(noinline)
+#  elif defined(__GNUC__) || defined(__clang__) || defined(__INTEL_COMPILER) || \
+        defined(__ibmxl__) || defined(__NVCOMPILER)
+#    define CRYPTER_NOINLINE __attribute__((noinline))
+#  else
+#    define CRYPTER_NOINLINE
 #  endif
 #endif
 
@@ -590,6 +613,35 @@ namespace DynamicCrypter {
             }
         }
 
+        // -------------------------------------------------------------------
+        //  The one place the ciphertext is read at run time
+        // -------------------------------------------------------------------
+        //  The transforms below are pure constant expressions and the ciphertext
+        //  is a constant in the image, so in principle a release build can fold a
+        //  whole decode and drop the plaintext into the binary as a constant -
+        //  which would defeat the library in exactly the builds that matter.
+        //
+        //  So the ciphertext bytes are read through a volatile view before any
+        //  transform sees them. A volatile access is the one kind of load a
+        //  conforming compiler may not delete, reorder, or replace with a value it
+        //  already knows, so from this copy onwards the plaintext is an opaque
+        //  runtime value: the transform is still a constant expression, but it is
+        //  applied to data whose value the optimizer cannot know, and nothing
+        //  downstream of it can be folded either, because encrypt() and decrypt()
+        //  only ever move values that came through here.
+        //
+        //  CRYPTER_NOINLINE puts a hard function boundary around the copy, so that
+        //  even a whole-program optimizer cannot propagate the site's bytes into
+        //  the decode. It is a hint, not a promise: what actually stops the fold is
+        //  the volatile read.
+        template <typename CharType, size_t Size>
+        CRYPTER_NOINLINE void copy_opaque(CharType (&out)[Size], const CharType* from) noexcept {
+            const volatile CharType* view = from;
+            for (size_t i = 0; i < Size; ++i) {
+                out[i] = view[i];
+            }
+        }
+
         // The inverse reads `in` and writes `out`. Passing the same buffer for
         // both is supported, and is what the Crypter object does when it turns
         // its own ciphertext back into text; walking the processing order
@@ -682,14 +734,17 @@ namespace DynamicCrypter {
         EncryptedString(const EncryptedString&) = delete;
         EncryptedString& operator=(const EncryptedString&) = delete;
 
-        // Out of place decryption: writes size() characters of plaintext into
-        // `out` and leaves the stored ciphertext untouched. There is therefore
-        // no moment at which the encrypted bytes *are* the plaintext, and
-        // nothing to restore afterwards - the cipher is still the cipher when
-        // this returns. `out` is not bounds checked: it has to hold at least
-        // size() characters.
-        CRYPTER_FORCEINLINE constexpr void decrypt(CharType* out) const noexcept {
-            detail::transform_inverse<FlavourT, Seed, CharType, Size>(out, _storage);
+        // Decodes into `out` and leaves the stored ciphertext untouched. The
+        // bytes go through detail::copy_opaque first, which is why this is
+        // deliberately not a constant expression: a volatile read can never be
+        // one, and that is the point - a decode the optimizer could evaluate at
+        // compile time is a decode it could emit as a constant plaintext.
+        //
+        // `out` is not bounds checked: it has to hold at least size() characters.
+        CRYPTER_FORCEINLINE void decrypt(CharType* out) const noexcept {
+            CharType opaque[Size] = {};
+            detail::copy_opaque(opaque, _storage);
+            detail::transform_inverse<FlavourT, Seed, CharType, Size>(out, opaque);
         }
 
         CRYPTER_FORCEINLINE constexpr const CharType* data() const noexcept { return _storage; }

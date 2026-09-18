@@ -13,7 +13,8 @@ Inspired by the structural architecture of `skCrypter`. Rather than eight hand-w
 * 🧹 **Every path ends in a wipe:** the buffer is cleared by `clear()`, or automatically by the destructor when the object goes out of scope.
 * 📦 **Header-Only:** simply drop `DynamicCrypter.hpp` into your project.
 * 🌍 **Portable:** no compiler-specific extension, no `<immintrin.h>`, no architecture requirement. MSVC, GCC, Clang, ICC and any other conforming C++17 compiler on x86, x64, ARM, RISC-V, ...
-* ✅ **Self-Verifying:** the whole header is a constant expression, so the test suite proves a full encrypt/decrypt round trip for every dimension, every seed and every character type *at compile time*.
+* ✅ **Self-Verifying:** the transforms are constant expressions, so the test suite proves a full encrypt/decrypt round trip for every dimension, every seed and every character type *at compile time*.
+* 🕵️ **Hard to constant-fold:** the run-time decode reads the ciphertext through a `volatile` view, so a release optimizer cannot evaluate the decode at compile time and drop the plaintext into the image as data. See *What this does and does not buy you*.
 
 ## Compiler support
 
@@ -162,7 +163,7 @@ Because this library uses `if constexpr` and guaranteed copy elision, **C++17 is
 * **MSVC / Visual Studio:** `/std:c++17` under Language Properties.
 * **GCC / Clang:** `-std=c++17`.
 
-For maximum stealth, ensure Release optimizations are active (`/O2`, `/Ob2` on MSVC) so the decryption inlines into the calling code. See *What this does and does not buy you* below before trusting the optimizer.
+For maximum stealth, ensure Release optimizations are active (`/O2`, `/Ob2` on MSVC): the per-site loop inlines into the calling code where the optimizer wants it. The one part that is *deliberately* not inlined is the short copy of the ciphertext that keeps the decode un-foldable - see *What this does and does not buy you* below.
 
 ## Configuration macros
 
@@ -170,6 +171,7 @@ For maximum stealth, ensure Release optimizations are active (`/O2`, `/Ob2` on M
 | --- | --- | --- |
 | `CRYPTER_BUILD_SALT` | `0u` | 32-bit value mixed into every site hash, and therefore into the seed and all four dimension selections. `0` keeps builds reproducible. The CMake option `DYNAMICCRYPTER_BUILD_SALT` generates a random value per build. |
 | `CRYPTER_FORCEINLINE` | `__forceinline` (MSVC) / `inline __attribute__((always_inline))` (GCC, Clang) / `inline` | Override the always-inline hint. Define it before including the header. |
+| `CRYPTER_NOINLINE` | `__declspec(noinline)` (MSVC) / `__attribute__((noinline))` (GCC, Clang) / nothing | Boundary around the one copy that keeps the decode un-foldable. Define it to nothing to let that copy inline: slightly faster, slightly weaker against whole-program constant propagation. |
 | `CRYPTER_NO_STANDARD_CHECK` | undefined | Suppress the C++17 check. Not recommended. |
 
 The `CRYPTER_USE_HW_CRC32` option of earlier revisions is gone; defining it now produces a `#pragma message` explaining why. See *Notes on this revision*.
@@ -283,7 +285,11 @@ The option generates a random 32-bit value, stores it in the CMake cache (so rec
 
 **The wipe is best effort.** `clear()` - and so the destructor - zeroes the object's buffer through a `volatile` view, which stops an optimizer from deleting the stores as dead code, but by then the characters may also sit in a register, in a `std::string` the caller built or in a buffer the C library owns. It narrows the window; it does not close it.
 
-**Known limitation worth checking on your own build:** with optimizations on, nothing in the current design *prevents* the compiler from constant-folding the decryption (the ciphertext is a constant, the transform is a pure constant expression) and emitting the plaintext. That would defeat the library in Release builds specifically. Decoding into the object's own buffer does not change that: a folded decode is still just a store of the constant plaintext, now into that buffer. Verify with a disassembler by searching a Release binary for a known string literal. The usual mitigations - a `noinline` boundary plus loading the ciphertext through a `volatile` view - cannot be combined with a fully `constexpr` header, so they are not enabled here; ask if you want them.
+**Constant folding is blocked, on purpose.** Because the ciphertext is a compile-time constant and the transform is a pure constant expression, a release optimizer could in principle evaluate a whole decode at compile time and emit the plaintext into the image as data - which would defeat the library in exactly the builds that matter. Every runtime decode therefore reads the ciphertext through a `volatile` view first (`detail::copy_opaque`) and only then runs the transform. A volatile access is the one kind of load a conforming compiler may not delete, reorder, or replace with a value it already knows, so the plaintext becomes an opaque run-time value and nothing downstream can be folded either - `encrypt()` and `decrypt()` only ever move values that came through that copy. `CRYPTER_NOINLINE` adds a function boundary on top, so even a whole-program optimizer cannot push the site's bytes into the decode.
+
+This is worth checking on your own build with a disassembler, because it is invisible at run time and a compiler is always free to be smarter than expected. In a Release build of this repository at `/O2` (MSVC 19.44), the old direct-from-the-constant path had the blob's bytes propagated into the instruction stream as `xor al, <immediate>` operands, with the site object not referenced at all any more - one step away from the plaintext existing as data. With the `volatile` copy in place the same build loads the bytes one at a time from the read-only blob (`movzx eax, BYTE PTR [rdx+rcx]`) and no plaintext literal appears in the binary.
+
+What it costs: one extra copy of `size()` characters on the stack per decode (the object's buffer plus the copy), and the copy is a real function call rather than inlined code. Those are the knobs behind `CRYPTER_NOINLINE`. What it does *not* change is the paragraph above - an emulator or a debugger still reads the plaintext out of memory at use, because on x86-64 and ARM64 alike there is no way to consume a string without it existing.
 
 ## Tests and example
 
@@ -317,9 +323,12 @@ The test target contains compile-time proofs plus run-time checks:
 * a check that over 256 sites the automatic selection reaches every value of every dimension, so a degenerate slice cannot silently shrink the flavour space;
 * run-time checks of the macro and its state machine - reads decode, `encrypt()` reports ciphertext and hides it, a read brings the text back, `clear()` ends it, and none of it touches the site - pointer lifetimes, repeated and overlapping use of one call site, and that different seeds really do produce different ciphertexts.
 
+Whether an optimizer folds a decode is not observable at run time, so the `volatile` copy that blocks it has no unit test; it is checked by disassembling a Release build, and the expected shape is recorded under *What this does and does not buy you*.
+
 ## Notes on this revision
 
-* `CRYPT_STR` yields a `DynamicCrypter::Crypter<...>`: one object that owns its buffer and flips it between plain and cipher through `get()` / `decrypt()` / `encrypt()` / `isEncrypted()` / `clear()`, the skCrypter model with the lifetime left to C++ - the destructor clears the buffer. The site it seeds from is a `static const` compile-time constant that nothing writes to, and the core API matches: `EncryptedString::decrypt(CharType* out)` decodes out of place, `transform_inverse` takes `(out, in)`, and the old in-place `encrypt()` is gone because the object recomputes its own ciphertext.
+* The run-time decode cannot be constant-folded any more. `EncryptedString::decrypt(CharType* out)` is no longer a constant expression: it copies the stored ciphertext through a `volatile` view (`detail::copy_opaque`, marked `CRYPTER_NOINLINE`) before running the transform, so the optimizer never has the ciphertext as a known value and can never produce the plaintext as data. The transforms themselves stay constant expressions, so the compile-time proofs and the compile-time encryption are unaffected.
+* `CRYPT_STR` yields a `DynamicCrypter::Crypter<...>`: one object that owns its buffer and flips it between plain and cipher through `get()` / `decrypt()` / `encrypt()` / `isEncrypted()` / `clear()`, the skCrypter model with the lifetime left to C++ - the destructor clears the buffer. The site it seeds from is a `static const` compile-time constant that nothing writes to, and the core API matches: `decrypt(CharType* out)` decodes out of place, `transform_inverse` takes `(out, in)`, and the old in-place `encrypt()` is gone because the object recomputes its own ciphertext.
 * `CRYPT_STR_RAW` was removed. It promised a `const char*` that outlives the statement, which an object owning its buffer cannot provide; copy the characters into storage you own instead (see *Pointer lifetime*).
 * `CRYPTER_USE_HW_CRC32` and the SSE4.2 CRC32 intrinsic path were removed: the keystream generator is shared with the compile-time encryption path, which must remain a constant expression, and an intrinsic cannot be one. CRC-32C survives as the portable `crc32c` keystream generator.
 * `DynamicCrypter::EncryptedString` now takes the flavour as a *type* (`Flavour<...>`) instead of an integer, and the helper functions moved into `DynamicCrypter::detail`.
